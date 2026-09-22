@@ -143,6 +143,11 @@ int main(int argc, char *argv[]) {
 
         }
         
+
+        // send the answer back to the client
+        uint64_t anwser_transformed = htobe64(anwser);
+        send(client_fd, &anwser_transformed, sizeof(anwser_transformed), 0);
+        
         print_hex(recived_hash, sizeof(recived_hash));
         close(client_fd);
         
