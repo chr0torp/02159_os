@@ -107,8 +107,8 @@ int main(int argc, char *argv[]) {
 
         // load the data from the buffer into the appropriate variables
         // hashed value is the first 32 bytes of the buffer
-        uint8_t recived_hash[32];
-        memcpy(recived_hash, buffer, 32);
+        uint8_t received_hash[32];
+        memcpy(received_hash, buffer, 32);
 
         // start value is the next 8 bytes of the buffer
         uint64_t start_value;
@@ -131,13 +131,13 @@ int main(int argc, char *argv[]) {
 
         // brute force the hash from start to end
         uint64_t i;
-        uint64_t anwser;
+        uint64_t answer;
         for (i = start_value_transformed; i <= end_value_transformed; i++) {
             uint8_t hash[32]; 
             lonesha256(hash, (const unsigned char *)&i, sizeof(i));
 
-            if (memcmp(hash, recived_hash, 32) == 0) {
-                anwser = i;
+            if (memcmp(hash, received_hash, 32) == 0) {
+                answer = i;
                 break;
             }
 
@@ -145,10 +145,10 @@ int main(int argc, char *argv[]) {
         
 
         // send the answer back to the client
-        uint64_t anwser_transformed = htobe64(anwser);
-        send(client_fd, &anwser_transformed, sizeof(anwser_transformed), 0);
+        uint64_t answer_transformed = htobe64(answer);
+        send(client_fd, &answer_transformed, sizeof(answer_transformed), 0);
         
-        print_hex(recived_hash, sizeof(recived_hash));
+        print_hex(received_hash, sizeof(received_hash));
         close(client_fd);
         
     }
