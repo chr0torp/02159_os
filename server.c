@@ -132,7 +132,7 @@ int main(int argc, char *argv[]) {
         // brute force the hash from start to end
         uint64_t i;
         uint64_t answer;
-        for (i = start_value_transformed; i <= end_value_transformed; i++) {
+        for (i = start_value_transformed; i < end_value_transformed; i++) {
             uint8_t hash[32]; 
             lonesha256(hash, (const unsigned char *)&i, sizeof(i));
 
