@@ -7,9 +7,15 @@
 #include <stdint.h>
 #include <errno.h>
 #include "messages.h"
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define LONESHA256_STATIC
 #include "lonesha256.h"
+
+// 4 forks max becuase the CPUs on our VMs seems to be 4, but I think this can be changed/played with a little bit
+#define MAX_CHILDREN 4
 
 
 // for testing. can be removed later
@@ -56,7 +62,7 @@ int main(int argc, char *argv[]) {
 
     printf("Socket bound to port %d successfully!\n", port);
 
-    if (listen(server_fd, 10) < 0) {
+    if (listen(server_fd, 1000) < 0) {
         perror("listen");
         close(server_fd);
         return 1;
@@ -66,8 +72,19 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in client_address;
     socklen_t client_len = sizeof(client_address);
 
-
+    int active_children = 0;
     while (1) {
+        // collect children that have already finished, without blocking
+        while (waitpid(-1, NULL, WNOHANG) > 0) {
+            active_children--;
+        }
+
+        // if both slots are busy, block until one child finishes
+        if (active_children >= MAX_CHILDREN) {
+            wait(NULL);
+            active_children--;
+        }
+
         printf("Waiting for a client...\n");
 
         int client_fd = accept(
@@ -78,10 +95,26 @@ int main(int argc, char *argv[]) {
 
         if (client_fd < 0) {
             perror("accept");
-            close(server_fd);
-            return 1;
+            continue;
         }
         printf("Client connected!\n");
+
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("fork");
+            close(client_fd);
+            continue;
+        }
+
+        if (pid > 0) {
+            active_children++; //counting children
+            close(client_fd);
+            continue;
+        }
+
+        // close server once a fork has been done
+        close(server_fd);
 
 
         // Receive the data from the client
@@ -100,9 +133,9 @@ int main(int argc, char *argv[]) {
         
         // fail if not fully received
         if (total_received != sizeof(buffer)) {
-            printf("Error total not equal to expected size");
+            printf("Error total not equal to expected size\n");
             close(client_fd);
-            continue;
+            exit(0);
         }
 
         // load the data from the buffer into the appropriate variables
@@ -131,7 +164,7 @@ int main(int argc, char *argv[]) {
 
         // brute force the hash from start to end
         uint64_t i;
-        uint64_t answer;
+        uint64_t answer = 0;
         for (i = start_value_transformed; i < end_value_transformed; i++) {
             uint8_t hash[32]; 
             lonesha256(hash, (const unsigned char *)&i, sizeof(i));
@@ -147,9 +180,11 @@ int main(int argc, char *argv[]) {
         // send the answer back to the client
         uint64_t answer_transformed = htobe64(answer);
         send(client_fd, &answer_transformed, sizeof(answer_transformed), 0);
-        
+
         print_hex(received_hash, sizeof(received_hash));
         close(client_fd);
+        //exiting the child
+        exit(0);
         
     }
 
