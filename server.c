@@ -11,16 +11,25 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <sys/mman.h>
+
 #define LONESHA256_STATIC
 #include "lonesha256.h"
 
-
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+    uint64_t answer;
+    int found;
+} SharedWork;
 
 /*
 4 forks max becuase the CPUs on our VMs seems to be 4 threads,
 needs to be set at 16 when submiting due to project specifications
 */
-#define MAX_CHILDREN 4
+#define CPU_THREADS 10
+#define WORKER 5
+#define MAX_CHILDREN (CPU_THREADS / WORKER)
 
 
 // for testing. can be removed later
@@ -78,18 +87,10 @@ int main(int argc, char *argv[]) {
     socklen_t client_len = sizeof(client_address);
 
     int active_children = 0;
+    pid_t worker_pids[WORKER];
+
     while (1) {
-        // collect children that have already finished, without blocking
-        while (waitpid(-1, NULL, WNOHANG) > 0) {
-            active_children--;
-        }
-
-        // if both slots are busy, block until one child finishes
-        if (active_children >= MAX_CHILDREN) {
-            wait(NULL);
-            active_children--;
-        }
-
+        
         printf("Waiting for a client...\n");
 
         int client_fd = accept(
@@ -104,23 +105,13 @@ int main(int argc, char *argv[]) {
         }
         printf("Client connected!\n");
 
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            perror("fork");
-            close(client_fd);
-            continue;
+        SharedWork *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        
+        if (work == MAP_FAILED) {
+            perror("SharedWork failed (mmap)");
+            close(server_fd);
+            exit(1);
         }
-
-        if (pid > 0) {
-            active_children++; //counting children
-            close(client_fd);
-            continue;
-        }
-
-        // close server once a fork has been done
-        close(server_fd);
-
 
         // Receive the data from the client
         // The expected size of the data is 49 bytes (32 bytes hash + 8 bytes start + 8 bytes end + 1 byte p)
@@ -166,31 +157,79 @@ int main(int argc, char *argv[]) {
         uint8_t p_value;
         memcpy(&p_value, buffer + 48, 1);
 
+        work->start = start_value_transformed;
+        work->end = end_value_transformed;
+        work->answer = 0;
+        work->found = 0;
 
-        // brute force the hash from start to end
-        uint64_t i;
-        uint64_t answer = 0;
-        for (i = start_value_transformed; i < end_value_transformed; i++) {
-            uint8_t hash[32]; 
-            lonesha256(hash, (const unsigned char *)&i, sizeof(i));
+        uint64_t step_size = (end_value_transformed - start_value_transformed) / WORKER;
 
-            if (memcmp(hash, received_hash, 32) == 0) {
-                answer = i;
-                break;
+        int i;
+        for (i=0; i<WORKER; i++) {
+
+            uint64_t start_chunk = start_value_transformed + (step_size * i);
+            uint64_t end_chunk = start_value_transformed + (step_size * (i+1));
+    
+            pid_t pid = fork();
+            printf("\npid=%d\n", (int)pid);
+
+            if (pid < 0) {
+                perror("fork");
+                close(client_fd);
+                exit(1);
             }
 
+            if (pid == 0) {
+                if (work->found) {
+                    exit(0);
+                }
+                printf("Worker %d, PID %d\n", i, (int)getpid());
+                // close server once a fork has been done
+                close(server_fd);
+
+                // brute force the hash from start to end
+                uint64_t i;
+                for (i = start_chunk; i < end_chunk; i++) {
+                    if (work->found) {
+                        break;
+                    }
+
+                    uint8_t hash[32]; 
+                    lonesha256(hash, (const unsigned char *)&i, sizeof(i));
+        
+                    if (memcmp(hash, received_hash, 32) == 0) {
+                        work->answer = i;
+                        work->found = 1;
+                        printf("answer found : %llu \n", i);
+                        exit(0);
+                    }
+                }
+                close(client_fd);
+                exit(0);
+
+            } else {
+                worker_pids[i] = pid;
+                active_children++;
+                
+            }
+            
         }
         
+        for (int worker_n = 0; worker_n < WORKER; worker_n++) {
 
-        // send the answer back to the client
-        uint64_t answer_transformed = htobe64(answer);
+            if (waitpid(worker_pids[worker_n], NULL, 0) < 0 ) {
+                perror("wait error 2 loop");
+            }
+
+            
+        }
+        uint64_t answer_transformed = htobe64(work->answer);
+        print_hex(received_hash, sizeof(received_hash));
         send(client_fd, &answer_transformed, sizeof(answer_transformed), 0);
 
-        print_hex(received_hash, sizeof(received_hash));
         close(client_fd);
-        //exiting the child
-        exit(0);
-        
+        munmap(work, sizeof(*work));
+ 
     }
 
     close(server_fd);
