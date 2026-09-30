@@ -14,7 +14,12 @@
 #define LONESHA256_STATIC
 #include "lonesha256.h"
 
-// 4 forks max becuase the CPUs on our VMs seems to be 4, but I think this can be changed/played with a little bit
+
+
+/*
+4 forks max becuase the CPUs on our VMs seems to be 4 threads,
+needs to be set at 16 when submiting due to project specifications
+*/
 #define MAX_CHILDREN 4
 
 
