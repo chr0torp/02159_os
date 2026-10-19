@@ -27,8 +27,8 @@ typedef struct {
 4 forks max becuase the CPUs on our VMs seems to be 4 threads,
 needs to be set at 16 when submiting due to project specifications
 */
-#define CPU_THREADS 10
-#define WORKER 5
+#define CPU_THREADS 4
+#define WORKER 2
 #define MAX_CHILDREN (CPU_THREADS / WORKER)
 
 
