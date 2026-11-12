@@ -1,2 +1,5 @@
-server: server.c
-	gcc -o server server.c -I.
+server: serverChris.c
+	gcc -o server serverChris.c -I.
+
+clean:
+	rm -f server
