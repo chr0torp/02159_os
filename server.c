@@ -12,12 +12,13 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <sys/time.h>
 
 #define LONESHA256_STATIC
 #include "lonesha256.h"
 
-#define MAX_WORKERS 16 // The execution server has 16 CPUs, and priority levels max out at 16
-#define PRIORITY_LEVELS MAX_WORKERS
+#define MAX_WORKERS 10 // The execution server has 16 CPUs, and priority levels max out at 16
+#define PRIORITY_LEVELS 16
 
 
 typedef struct {
@@ -37,6 +38,7 @@ typedef struct Request {
     uint64_t start;
     uint64_t end;
     uint8_t priority;
+    int inputTime;
 
     struct Request *next;
 } Request;
@@ -51,9 +53,39 @@ typedef struct {
 Queue priority_queues[PRIORITY_LEVELS] = {0};
 
 
+void addAge(void) {
+    for (int i = 0; PRIORITY_LEVELS - 1 >= i; i++) {
+            Request *current = priority_queues[i].head;
+            while (current != NULL) {
+                current->inputTime += 1;
+                current = current->next;
+            }
+        }
+}
+
+void queueState(void) {
+    printf("Queue state:\n");
+    for (int i = PRIORITY_LEVELS - 1; i >= 0; i--) {
+        printf("\n\n");
+        printf("Priority %d: ", i + 1);
+
+        Request *current = priority_queues[i].head;
+        if (current == NULL) {
+            printf("(empty)");
+        }
+        while (current != NULL) {
+            printf(
+                "fd=%d, ticker=%d,   ", current->client_fd, current->inputTime);
+            current = current->next;
+        }
+        printf("\n");
+    }
+}
+
 // ------------------------------------------------------------
 // Priority Queue
 // ------------------------------------------------------------
+
 
 void enqueue(Request *request) {
     int index = request->priority - 1;
@@ -80,25 +112,37 @@ Request *dequeue_highest(void) {
     // priority_queues[15] = priority 16
     // priority_queues[0]  = priority 1
 
+    Request *request = NULL;
+    int currentWeight = -1;
+    int currentIndex = PRIORITY_LEVELS - 1;
+
     for (int i = PRIORITY_LEVELS - 1; i >= 0; i--) {
 
         if (priority_queues[i].head != NULL) {
+            int iWeight = priority_queues[i].head->inputTime / (PRIORITY_LEVELS - i);
+            
+            if (iWeight > currentWeight) {
 
-            Request *request = priority_queues[i].head;
+                request = priority_queues[i].head;
+                currentWeight = iWeight;
+                currentIndex = i;
 
-            priority_queues[i].head = request->next;
-
-            if (priority_queues[i].head == NULL) {
-                priority_queues[i].tail = NULL;
             }
-
-            request->next = NULL;
-
-            return request;
         }
     }
 
-    return NULL;
+    if (request == NULL) {
+        return NULL;
+    }
+
+    priority_queues[currentIndex].head = request->next;
+    if (priority_queues[currentIndex].head == NULL) {
+        priority_queues[currentIndex].tail = NULL;
+    }
+    request->next = NULL;
+
+
+    return request;
 }
 
 
@@ -206,6 +250,7 @@ int start_request(Request *request, int server_fd) {
 
 
 int main(int argc, char *argv[]) {
+    printf("starting server __________----------__________----------");
 
     int port;
     if (argc < 2) {
@@ -283,9 +328,13 @@ int main(int argc, char *argv[]) {
     }
 
 
-
+    int count_age = 0;
     int active = 0;
     while (1) {
+        count_age += 1;
+        if (count_age % 100 == 0) {
+            addAge();
+        }
 
         while (waitpid(-1, NULL, WNOHANG) > 0) {
         if (active > 0) {
@@ -294,10 +343,12 @@ int main(int argc, char *argv[]) {
         }
         while (active < 4) { 
         Request *next_request = dequeue_highest();
+        
         if (next_request == NULL) {
             break; 
         }
-        
+        queueState();
+
         printf("[DISPATCH] Starting priority %d with %d active managers.\n", next_request->priority, active);
         
         if (start_request(next_request, server_fd) > 0) {
@@ -316,10 +367,10 @@ int main(int argc, char *argv[]) {
         }
 
         // MAC shit outcomment when push to main!!!!
-        // int c_flags = fcntl(client_fd, F_GETFL, 0);
-        // if (c_flags >= 0) {
-        //     fcntl(client_fd, F_SETFL, c_flags & ~O_NONBLOCK);
-        // }
+        int c_flags = fcntl(client_fd, F_GETFL, 0);
+        if (c_flags >= 0) {
+            fcntl(client_fd, F_SETFL, c_flags & ~O_NONBLOCK);
+        }
         // MAC shit outcomment when push to main!!!!
 
         printf("Client connected!\n");
@@ -426,14 +477,16 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        request->inputTime = 1; // 0 is not good because need to divide later
+
         enqueue(request);
 
-
         printf(
-            "[QUEUE] priority=%u range=[%llu,%llu)\n",
+            "[QUEUE] priority=%u range=[%llu,%llu) ticker=%d\n",
             request->priority,
             (unsigned long long)request->start,
-            (unsigned long long)request->end
+            (unsigned long long)request->end,
+            request->inputTime
         );
 
 
