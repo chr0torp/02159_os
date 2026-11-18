@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "messages.h"
 #include <errno.h>
 #include <signal.h>
@@ -13,18 +14,27 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <math.h>
 
 #define LONESHA256_STATIC
 #include "lonesha256.h"
 
-#define MAX_WORKERS 10 // The execution server has 16 CPUs, and priority levels max out at 16
 #define PRIORITY_LEVELS 16
-
 
 typedef struct {
     uint64_t answer;
-    int found;
+    volatile int found;
 } SharedWork;
+
+typedef struct {
+    pid_t pid;
+    int cpu;
+} ManagerStruct;
+
+ManagerStruct managerList[16];
+int num_trackers = 0;
+int active_cpu = 0;
+
 
 
 // ------------------------------------------------------------
@@ -107,18 +117,19 @@ void enqueue(Request *request) {
 }
 
 
-Request *dequeue_highest(void) {
+Request *dequeue_highest(bool priorityCheck) {
 
     // priority_queues[15] = priority 16
     // priority_queues[0]  = priority 1
 
     Request *request = NULL;
     int currentWeight = -1;
-    int currentIndex = PRIORITY_LEVELS - 1;
+    int currentIndex = -1;
 
     for (int i = PRIORITY_LEVELS - 1; i >= 0; i--) {
 
         if (priority_queues[i].head != NULL) {
+            
             int iWeight = priority_queues[i].head->inputTime / (PRIORITY_LEVELS - i);
             
             if (iWeight > currentWeight) {
@@ -135,6 +146,10 @@ Request *dequeue_highest(void) {
         return NULL;
     }
 
+    if (priorityCheck) {
+        return priority_queues[currentIndex].head;
+    }
+
     priority_queues[currentIndex].head = request->next;
     if (priority_queues[currentIndex].head == NULL) {
         priority_queues[currentIndex].tail = NULL;
@@ -146,8 +161,8 @@ Request *dequeue_highest(void) {
 }
 
 
-int start_request(Request *request, int server_fd) {
-
+int start_request(Request *request, int server_fd, int num_workers) {
+    
     pid_t pid = fork();
 
     if (pid < 0) {
@@ -164,8 +179,11 @@ int start_request(Request *request, int server_fd) {
         close(request->client_fd);
         free(request);
 
-        return 1;
+        return pid;
     }
+
+    printf("Manager process started for priority %d, with %d workers\n", request->priority, num_workers);
+    printf("Manager PID: %d\n", getpid());
 
     // Map shared memory for the workers
     SharedWork *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -178,10 +196,10 @@ int start_request(Request *request, int server_fd) {
     work->found = 0;
 
 
-    pid_t worker_pids[MAX_WORKERS];
-    int num_workers = request->priority;
+    pid_t worker_pids[16];
+
     if (num_workers < 1) num_workers = 1;
-    if (num_workers > MAX_WORKERS) num_workers = MAX_WORKERS;
+    if (num_workers > 16) num_workers = 16;
 
     uint64_t total_range = request->end - request->start;
     
@@ -208,6 +226,8 @@ int start_request(Request *request, int server_fd) {
         if (pid == 0) { 
             close(server_fd); 
 
+            printf("Worker %d processing range [%llu, %llu)\n", i, (unsigned long long)start_chunk, (unsigned long long)end_chunk);
+
             for (uint64_t j = start_chunk; j < end_chunk; j++) {
                 if (work->found) {
                     break;
@@ -231,6 +251,8 @@ int start_request(Request *request, int server_fd) {
         }
     }
     
+
+
     for (int worker_n = 0; worker_n < num_workers; worker_n++) {
         if (waitpid(worker_pids[worker_n], NULL, 0) < 0 ) {
             perror("wait error in loop");
@@ -239,18 +261,28 @@ int start_request(Request *request, int server_fd) {
 
     // Send the result
     uint64_t answer_transformed = htobe64(work->answer);
-    send(request->client_fd, &answer_transformed, sizeof(answer_transformed), 0);
+
+    ssize_t correct = send(request->client_fd, &answer_transformed, sizeof(answer_transformed), 0);
+    if (correct != sizeof(answer_transformed)) {
+        printf("\n\nsend failed\n\n");
+        printf("\n\nsend failed\n\n");
+        printf("\n\nsend failed\n\n");
+        printf("\n\nsend failed\n\n");
+        perror("send failed");
+    }
+
 
     close(request->client_fd);
     // Clean up shared memory in parent
     munmap(work, sizeof(*work)); 
 
-    exit(1);
+    exit(0);
 }
 
 
 int main(int argc, char *argv[]) {
     printf("starting server __________----------__________----------");
+    signal(SIGPIPE, SIG_IGN);
 
     int port;
     if (argc < 2) {
@@ -329,31 +361,62 @@ int main(int argc, char *argv[]) {
 
 
     int count_age = 0;
-    int active = 0;
     while (1) {
         count_age += 1;
         if (count_age % 100 == 0) {
             addAge();
         }
 
-        while (waitpid(-1, NULL, WNOHANG) > 0) {
-        if (active > 0) {
-            active--;
+        pid_t dead_pid;
+        while ((dead_pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+            for (int i = 0; i < num_trackers; i++) {
+                if (managerList[i].pid == dead_pid) {
+                    active_cpu -= managerList[i].cpu;
+                    managerList[i] = managerList[num_trackers - 1];
+                    num_trackers--;
+                    break;
+                }
             }
         }
-        while (active < 4) { 
-        Request *next_request = dequeue_highest();
-        
-        if (next_request == NULL) {
-            break; 
-        }
-        queueState();
 
-        printf("[DISPATCH] Starting priority %d with %d active managers.\n", next_request->priority, active);
-        
-        if (start_request(next_request, server_fd) > 0) {
-            active++;
+
+
+        while (1) { 
+
+            if (active_cpu >= 16) {
+                break;
             }
+
+            Request *next_request = dequeue_highest(true);
+            if (next_request == NULL) {
+                break; 
+            }
+
+            int required_cpu = next_request->priority;
+            if (required_cpu < 1) {
+                required_cpu = 1;
+            }
+
+            if (active_cpu + required_cpu > 16) {
+                int ceilNum = ceil((double)required_cpu / 2);
+                if (active_cpu + ceilNum > 16 || active_cpu == 16) {
+                    break;
+                } else {
+                    required_cpu = ceilNum;
+                }
+            }
+
+            next_request = dequeue_highest(false);
+
+            pid_t manager_pid = start_request(next_request, server_fd, required_cpu);
+
+            if (manager_pid > 0) {
+                managerList[num_trackers].pid = manager_pid;
+                managerList[num_trackers].cpu =  required_cpu;
+                num_trackers++;
+                active_cpu +=  required_cpu;
+                }
+
         }
 
         int client_fd = accept(server_fd, (struct sockaddr *)&client_address, &client_len);

@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "messages.h"
 #include <errno.h>
 #include <signal.h>
@@ -12,12 +13,11 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <fcntl.h>
-#include <sys/time.h>
 
 #define LONESHA256_STATIC
 #include "lonesha256.h"
 
-#define MAX_WORKERS 10 // The execution server has 16 CPUs, and priority levels max out at 16
+#define MAX_WORKERS 16 // The execution server has 16 CPUs, and priority levels max out at 16
 #define PRIORITY_LEVELS 16
 
 
@@ -25,6 +25,16 @@ typedef struct {
     uint64_t answer;
     int found;
 } SharedWork;
+
+typedef struct {
+    pid_t pid;
+    int cpu;
+} ManagerStruct;
+
+ManagerStruct managerList[16];
+int num_trackers = 0;
+int active_cpu = 0;
+
 
 
 // ------------------------------------------------------------
@@ -38,7 +48,6 @@ typedef struct Request {
     uint64_t start;
     uint64_t end;
     uint8_t priority;
-    int inputTime;
 
     struct Request *next;
 } Request;
@@ -53,39 +62,9 @@ typedef struct {
 Queue priority_queues[PRIORITY_LEVELS] = {0};
 
 
-void addAge(void) {
-    for (int i = 0; PRIORITY_LEVELS - 1 >= i; i++) {
-            Request *current = priority_queues[i].head;
-            while (current != NULL) {
-                current->inputTime += 1;
-                current = current->next;
-            }
-        }
-}
-
-void queueState(void) {
-    printf("Queue state:\n");
-    for (int i = PRIORITY_LEVELS - 1; i >= 0; i--) {
-        printf("\n\n");
-        printf("Priority %d: ", i + 1);
-
-        Request *current = priority_queues[i].head;
-        if (current == NULL) {
-            printf("(empty)");
-        }
-        while (current != NULL) {
-            printf(
-                "fd=%d, ticker=%d,   ", current->client_fd, current->inputTime);
-            current = current->next;
-        }
-        printf("\n");
-    }
-}
-
 // ------------------------------------------------------------
 // Priority Queue
 // ------------------------------------------------------------
-
 
 void enqueue(Request *request) {
     int index = request->priority - 1;
@@ -107,47 +86,39 @@ void enqueue(Request *request) {
 }
 
 
-Request *dequeue_highest(void) {
+Request *dequeue_highest(bool priorityCheck) {
 
     // priority_queues[15] = priority 16
     // priority_queues[0]  = priority 1
 
-    Request *request = NULL;
-    int currentWeight = -1;
-    int currentIndex = PRIORITY_LEVELS - 1;
-
     for (int i = PRIORITY_LEVELS - 1; i >= 0; i--) {
 
         if (priority_queues[i].head != NULL) {
-            int iWeight = priority_queues[i].head->inputTime / (PRIORITY_LEVELS - i);
-            
-            if (iWeight > currentWeight) {
-
-                request = priority_queues[i].head;
-                currentWeight = iWeight;
-                currentIndex = i;
-
+            if (priorityCheck) {
+                return priority_queues[i].head;
+                continue; 
             }
+
+            Request *request = priority_queues[i].head;
+
+            priority_queues[i].head = request->next;
+
+            if (priority_queues[i].head == NULL) {
+                priority_queues[i].tail = NULL;
+            }
+
+            request->next = NULL;
+
+            return request;
         }
     }
 
-    if (request == NULL) {
-        return NULL;
-    }
-
-    priority_queues[currentIndex].head = request->next;
-    if (priority_queues[currentIndex].head == NULL) {
-        priority_queues[currentIndex].tail = NULL;
-    }
-    request->next = NULL;
-
-
-    return request;
+    return NULL;
 }
 
 
 int start_request(Request *request, int server_fd) {
-
+    
     pid_t pid = fork();
 
     if (pid < 0) {
@@ -164,8 +135,11 @@ int start_request(Request *request, int server_fd) {
         close(request->client_fd);
         free(request);
 
-        return 1;
+        return pid;
     }
+
+    printf("Manager process started for priority %d\n", request->priority);
+    printf("Manager PID: %d\n", getpid());
 
     // Map shared memory for the workers
     SharedWork *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -178,10 +152,10 @@ int start_request(Request *request, int server_fd) {
     work->found = 0;
 
 
-    pid_t worker_pids[MAX_WORKERS];
+    pid_t worker_pids[16];
     int num_workers = request->priority;
     if (num_workers < 1) num_workers = 1;
-    if (num_workers > MAX_WORKERS) num_workers = MAX_WORKERS;
+    if (num_workers > 16) num_workers = 16;
 
     uint64_t total_range = request->end - request->start;
     
@@ -208,6 +182,8 @@ int start_request(Request *request, int server_fd) {
         if (pid == 0) { 
             close(server_fd); 
 
+            printf("Worker %d processing range [%llu, %llu)\n", i, (unsigned long long)start_chunk, (unsigned long long)end_chunk);
+
             for (uint64_t j = start_chunk; j < end_chunk; j++) {
                 if (work->found) {
                     break;
@@ -231,6 +207,8 @@ int start_request(Request *request, int server_fd) {
         }
     }
     
+
+
     for (int worker_n = 0; worker_n < num_workers; worker_n++) {
         if (waitpid(worker_pids[worker_n], NULL, 0) < 0 ) {
             perror("wait error in loop");
@@ -245,12 +223,11 @@ int start_request(Request *request, int server_fd) {
     // Clean up shared memory in parent
     munmap(work, sizeof(*work)); 
 
-    exit(1);
+    exit(0);
 }
 
 
 int main(int argc, char *argv[]) {
-    printf("starting server __________----------__________----------");
 
     int port;
     if (argc < 2) {
@@ -328,32 +305,50 @@ int main(int argc, char *argv[]) {
     }
 
 
-    int count_age = 0;
-    int active = 0;
+
     while (1) {
-        count_age += 1;
-        if (count_age % 100 == 0) {
-            addAge();
-        }
 
-        while (waitpid(-1, NULL, WNOHANG) > 0) {
-        if (active > 0) {
-            active--;
+        pid_t dead_pid;
+        while ((dead_pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+            for (int i = 0; i < num_trackers; i++) {
+                if (managerList[i].pid == dead_pid) {
+                    active_cpu -= managerList[i].cpu;
+                    managerList[i] = managerList[num_trackers - 1];
+                    num_trackers--;
+                    break;
+                }
             }
         }
-        while (active < 4) { 
-        Request *next_request = dequeue_highest();
-        
-        if (next_request == NULL) {
-            break; 
-        }
-        queueState();
 
-        printf("[DISPATCH] Starting priority %d with %d active managers.\n", next_request->priority, active);
-        
-        if (start_request(next_request, server_fd) > 0) {
-            active++;
+
+
+        while (1) { 
+
+            Request *next_request = dequeue_highest(true);
+            if (next_request == NULL) {
+                break; 
             }
+
+            int required_cpu = next_request->priority;
+            if (required_cpu != 16) {
+                required_cpu += 1;
+            }
+
+            if (active_cpu + required_cpu > 16) {
+                break;
+            }
+
+            next_request = dequeue_highest(false);
+            
+            pid_t manager_pid = start_request(next_request, server_fd);
+
+            if (manager_pid > 0) {
+                managerList[num_trackers].pid = manager_pid;
+                managerList[num_trackers].cpu = required_cpu;
+                num_trackers++;
+                active_cpu += required_cpu;
+                }
+
         }
 
         int client_fd = accept(server_fd, (struct sockaddr *)&client_address, &client_len);
@@ -367,10 +362,10 @@ int main(int argc, char *argv[]) {
         }
 
         // MAC shit outcomment when push to main!!!!
-        int c_flags = fcntl(client_fd, F_GETFL, 0);
-        if (c_flags >= 0) {
-            fcntl(client_fd, F_SETFL, c_flags & ~O_NONBLOCK);
-        }
+        // int c_flags = fcntl(client_fd, F_GETFL, 0);
+        // if (c_flags >= 0) {
+        //     fcntl(client_fd, F_SETFL, c_flags & ~O_NONBLOCK);
+        // }
         // MAC shit outcomment when push to main!!!!
 
         printf("Client connected!\n");
@@ -477,16 +472,14 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        request->inputTime = 1; // 0 is not good because need to divide later
-
         enqueue(request);
 
+
         printf(
-            "[QUEUE] priority=%u range=[%llu,%llu) ticker=%d\n",
+            "[QUEUE] priority=%u range=[%llu,%llu)\n",
             request->priority,
             (unsigned long long)request->start,
-            (unsigned long long)request->end,
-            request->inputTime
+            (unsigned long long)request->end
         );
 
 
